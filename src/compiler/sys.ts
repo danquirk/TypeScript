@@ -6,10 +6,14 @@ namespace ts {
         newLine: string;
         useCaseSensitiveFileNames: boolean;
         write(s: string): void;
-        readFile(path: string, encoding?: string): string;
-        writeFile(path: string, data: string, writeByteOrderMark?: boolean): void;
-        watchFile?(path: string, callback: (path: string, removed?: boolean) => void): FileWatcher;
+        readFile(fileName: string, encoding?: string): string;
+        writeFile(fileName: string, data: string, writeByteOrderMark?: boolean): void;
+        watchFile?(fileName: string, callback: (fileName: string) => void): FileWatcher;
         watchDirectory?(path: string, callback: (path: string) => void, recursive?: boolean): FileWatcher;
+        getTempDir(): string;
+        /// Gets the last time the file was modified, in Unix Time
+        getFileWriteTime?(fileName: string): number;
+        https?(url: string, callback: (err: any, data: string) => void): void;
         resolvePath(path: string): string;
         fileExists(path: string): boolean;
         directoryExists(path: string): boolean;
@@ -19,6 +23,7 @@ namespace ts {
         readDirectory(path: string, extension?: string, exclude?: string[]): string[];
         getMemoryUsage?(): number;
         exit(exitCode?: number): void;
+        httpsPost?(url: string, data: string, contentType: string, callback?: (err: any, data: string) => void): void;
     }
 
     interface WatchedFile {
@@ -35,6 +40,7 @@ namespace ts {
     declare var module: any;
     declare var process: any;
     declare var global: any;
+    declare var url: any;
     declare var __filename: string;
     declare var Buffer: {
         new (str: string, encoding?: string): any;
@@ -62,6 +68,10 @@ namespace ts {
             let args: string[] = [];
             for (let i = 0; i < WScript.Arguments.length; i++) {
                 args[i] = WScript.Arguments.Item(i);
+            }
+
+            function getTempDir(): string {
+                return fso.GetSpecialFolder(2 /* TemporaryFolder */);
             }
 
             function readFile(fileName: string, encoding?: string): string {
@@ -162,6 +172,7 @@ namespace ts {
                 write(s: string): void {
                     WScript.StdOut.Write(s);
                 },
+                getTempDir,
                 readFile,
                 writeFile,
                 resolvePath(path: string): string {
@@ -197,7 +208,9 @@ namespace ts {
         function getNodeSystem(): System {
             const _fs = require("fs");
             const _path = require("path");
-            const _os = require("os");
+            const _os = require('os');
+            const _https = require('https');
+            const _url = require('url');
 
             // average async stat takes about 30 microseconds
             // set chunk size to do 30 files in < 1 millisecond
@@ -342,6 +355,10 @@ namespace ts {
                 return useCaseSensitiveFileNames ? path.toLowerCase() : path;
             }
 
+            function getTempDir(): string {
+                return _os.tmpdir();
+            }
+
             function readDirectory(path: string, extension?: string, exclude?: string[]): string[] {
                 let result: string[] = [];
                 exclude = map(exclude, s => getCanonicalPath(combinePaths(path, s)));
@@ -370,6 +387,42 @@ namespace ts {
                 }
             }
 
+            function httpsPost(destUrl: string, data: string, contentType: string, callback?: (err: any, data: string) => void) {
+                var parsedUrl = _url.parse(destUrl);
+                var opts = {
+                    host: parsedUrl.host,
+                    path: parsedUrl.path,
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': contentType,
+                        'Content-Length': data.length
+                    }
+                };
+                var req = _https.request(opts, (response: any) => {
+                    var body = '';
+                    response.on('data', (data: string) => {
+                        body = body + data;
+                    });
+                    response.on('end', () => callback && callback(undefined, body));
+                });
+                req.on('error', (err: any) => callback && callback(err, undefined));
+                req.write(data);
+            }
+            
+            function getFileWriteTime(path: string): number {
+                return Math.floor(Date.parse(_fs.statSync(path).mtime) / 1000);
+            }
+
+            function https(url: string, callback: (err: any, data: string) => void) {
+                _https.get(url, (res: any) => {
+                    var body = '';
+                    res.on('data', (data: string) => {
+                        body = body + data;
+                    });
+                    res.on('end', () => callback(undefined, body));
+                }).on('error', (err: any) => callback(err, undefined));
+            }
+
             return {
                 args: process.argv.slice(2),
                 newLine: _os.EOL,
@@ -384,7 +437,8 @@ namespace ts {
                         offset += written;
                         toWrite -= written;
                     }
-                },
+                },  
+                getTempDir,
                 readFile,
                 writeFile,
                 watchFile: (fileName, callback) => {
@@ -419,6 +473,8 @@ namespace ts {
                         }
                     );
                 },
+                https,
+                getFileWriteTime,
                 resolvePath: function (path: string): string {
                     return _path.resolve(path);
                 },
@@ -448,7 +504,8 @@ namespace ts {
                 },
                 exit(exitCode?: number): void {
                     process.exit(exitCode);
-                }
+                },
+                httpsPost
             };
         }
         if (typeof WScript !== "undefined" && typeof ActiveXObject === "function") {

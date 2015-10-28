@@ -1340,6 +1340,9 @@ namespace ts.server {
             InsertSpaceAfterOpeningAndBeforeClosingNonemptyBrackets: false,
             PlaceOpenBraceOnNewLineForFunctions: false,
             PlaceOpenBraceOnNewLineForControlBlocks: false,
+            SendMetrics: false,
+            TelemetryUserID: null,
+            CheckForDtsUpdates: false
         }
     }
 

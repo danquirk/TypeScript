@@ -3,8 +3,8 @@
 /// <reference path="protocol.d.ts" />
 /// <reference path="editorServices.ts" />
 
-namespace ts.server {
-    var spaceCache:string[] = [];
+module ts.server {
+    var spaceCache: string[] = [];
 
     interface StackTraceError extends Error {
         stack?: string;
@@ -17,7 +17,7 @@ namespace ts.server {
                 strBuilder += " ";
             }
             spaceCache[n] = strBuilder;
-        }  
+        }
         return spaceCache[n];
     }
 
@@ -66,7 +66,7 @@ namespace ts.server {
             return 1;
         }
     }
-       
+
     function formatDiag(fileName: string, project: Project, diag: ts.Diagnostic) {
         return {
             start: project.compilerService.host.positionToLineOffset(fileName, diag.start),
@@ -119,11 +119,156 @@ namespace ts.server {
         export const Unknown = "unknown";
     }
 
-    module Errors { 
+    module Metrics {
+        var eventCounts: Map<number> = {};
+        var properties: Map<string> = {};
+        let dtsCount = 0;
+
+        const sendInterval = 1000 * 60 * 5; // 5 minutes
+        let nextSendTimeMs = Date.now() + sendInterval;
+
+        const settingNames = [
+            "allowNonTsExtensions",
+            "declaration",
+            "emitBOM",
+            "emitDecoratorMetadata",
+            "experimentalAsyncFunctions",
+            "jsx",
+            "isolatedModules",
+            "module",
+            "moduleResolution",
+            "noEmit",
+            "noEmitOnError",
+            "noImplicitAny",
+            "noLib",
+            "noResolve",
+            "out",
+            "outFile",           
+            "preserveConstEnums",
+            "removeComments",
+            "suppressImplicitAnyIndexErrors",
+            "target"
+        ];
+
+        // Keeps a count of total invocations of various language service operations (rename, gotodef, etc)
+        export function countEvent(eventName: string, projectSvc: ProjectService, host: ts.System) {
+            let opts = projectSvc.getFormatCodeOptions();
+            if (opts.SendMetrics) {
+                eventCounts[eventName] = (eventCounts[eventName] || 0) + 1;
+
+                if (Date.now() > nextSendTimeMs) {
+                    registerSettings(projectSvc);                    
+                    send(host, opts.TelemetryUserID);
+                }
+            }
+        }
+
+        // Keeps track of any .d.ts files used which correspond to known versions from DefinitelyTyped
+        export function countDts(file: string) {
+            for(var i in properties) {
+                if(properties[i] == file) {
+                    return;
+                }
+            }
+            properties['dtf' + ++dtsCount] = file;
+        }
+
+        function registerSettings(svc: ProjectService) {
+            properties['host'] = svc.hostConfiguration.hostInfo;
+            properties['inferredProjects'] = svc.inferredProjects.length.toString();
+            properties['configuredProjects'] = svc.configuredProjects.length.toString();
+
+            let someProject: Project = undefined;
+            if (svc.configuredProjects.length > 0) {
+                someProject = svc.configuredProjects[0];
+            } else if (svc.inferredProjects.length > 0) {
+                someProject = svc.inferredProjects[0];
+            }
+
+            let src = someProject && someProject.projectOptions && someProject.projectOptions.compilerOptions;
+            if (src) {
+                for (var i = 0, n = settingNames.length; i < n; i++) {
+                    let setting = settingNames[i];
+                    let value: any = src[settingNames[i]];
+                    // actual value of out or outFile is PII, don't record it, just record the flag was used
+                    if((setting == "out" || setting == "outFile") && value != null && value != '') {
+                        value = 1;
+                    }
+                    properties['project.' + settingNames[i]] = value;
+                }
+            }
+        }
+
+        function send(host: ts.System, userID: string) {
+            var data = [{
+                iKey: '78e2d1f3-b56d-47d8-9b9a-fa4c056a0f21',
+                name: 'Microsoft.ApplicationInsights.Event',
+                time: new Date().toUTCString(),
+                data: {
+                    baseType: 'EventData',
+                    baseData: {
+                        ver: 2,
+                        name: 'TypeScriptLanguageServiceEvent',
+                        measurements: eventCounts,
+                        properties: properties
+                    }
+                },
+                tags: {
+                    'ai.user.id': userID
+                }
+            }];
+            var payload = JSON.stringify(data);
+            
+            host.httpsPost('https://dc.services.visualstudio.com/v2/track', payload, 'application/json');
+            
+            eventCounts = {};
+            properties = {};
+            dtsCount = 0;
+            nextSendTimeMs = Date.now() + sendInterval;
+        }
+    }
+
+    module Errors {
         export var NoProject = new Error("No Project.");
     }
 
     export interface ServerHost extends ts.System {
+    }
+
+    interface DtsHistoryRecord {
+        /// Filename
+        n: string;
+        /// Path (the parent folder of this file)
+        p: string;
+        /// History (list of dtsHash values; newest in index 0)
+        h: string[];
+    }
+    type DtsHistory = DtsHistoryRecord[];
+
+    function dtsHash(s: string) {
+        // This is a whitespace-ignoring hash function so we can still correctly detect
+        // .d.ts files that have been auto-formatted or line-ending-normalized
+        var h = 0;
+        for (var i = 0, n = s.length; i < n; i++) {
+            var c = s.charCodeAt(i);
+            switch (c) {
+                // Characters we'll ignore
+                case 0x00: // Null
+                case 0x09: // Tab
+                case 0x0A: // LF
+                case 0x0D: // CR
+                case 0x20: // Space
+                case 0xFEFF: // BOM bytes
+                    break;
+                default:
+                    var high = h & 0xFF000000;
+                    h = (h << 8) & 0x7FFFFFFF;
+                    h = h ^ (high >> 24);
+                    h = h ^ c;
+                    break;
+            }
+        }
+        return h.toString(36);
     }
 
     export class Session {
@@ -134,6 +279,7 @@ namespace ts.server {
         private errorTimer: any; /*NodeJS.Timer | number*/
         private immediateId: any;
         private changeSeq = 0;
+        private dtsVersionHistory: DtsHistory = undefined;
 
         constructor(
             private host: ServerHost, 
@@ -142,7 +288,7 @@ namespace ts.server {
             private logger: Logger
         ) {
             this.projectService =
-                new ProjectService(host, logger, (eventName,project,fileName) => {
+                new ProjectService(host, logger, (eventName, project, fileName) => {
                 this.handleEvent(eventName, project, fileName);
             });
         }
@@ -238,9 +384,103 @@ namespace ts.server {
             }
         }
 
+        static matchFileByHash(file: string, index: DtsHistory, host: System): { fileName: string; path: string; commitsBehind: number; } {
+            // See if a file with this name is in the index
+            var lastSlash = Math.max(file.lastIndexOf('/'), file.lastIndexOf('\\'), -1);
+            var filenameOnly = file.substr(lastSlash + 1);
+            for (var i = 0; i < index.length; i++) {
+                if (index[i].n === filenameOnly) {
+                    // Just check for a filename match, ignore commit history
+                    return { fileName: filenameOnly, path: index[i].p, commitsBehind: -1 };
+                    
+                    // Alternatively, we could check against the .d.ts history and report how many commits behind it is
+                    /*var crc = dtsHash(host.readFile(file, 'utf-8'));
+                    for (var j = 0; j < index[i].h.length; j++) {
+                        if (crc === index[i].h[j]) {
+                            return { fileName: filenameOnly, path: index[i].p, commitsBehind: j };
+                        }
+                    }*/
+                }
+            }
+            return undefined;
+        }
+
+        private fetchingDts = false;
+        upToDateCheck(file: string, project: Project) {
+            if (this.projectService.getFormatCodeOptions(ts.normalizePath(file)).CheckForDtsUpdates === false) return;
+
+            var doUpToDateCheck = () => {
+                try {
+                    var info = Session.matchFileByHash(file, this.dtsVersionHistory, this.host);
+                    if (info) {
+                        Metrics.countDts(info.fileName);
+                        
+                        // We could consider reporting errors here if the DTS is out of date
+                        /*if(info.commitsBehind > 0) {
+                            // Not up to date
+                            this.event({
+                                file: file, diagnostics: [{
+                                    start: { line: 1, offset: 0 },
+                                    end: { line: 2, offset: 0 },
+                                    text: 'File ' + file + ' is ' + info.commitsBehind + ' commits out-of-date'
+                                }]
+                            }, 'semanticDiag');
+                        }*/
+                    }
+                } catch (err) {    
+                    this.logError(err, "up-to-date check");
+                }
+            };
+
+            try {
+                if (this.host.https && /\.d\.ts$/i.test(file)) { // Is this a .d.ts file?
+                    // only download once per session and if we're not in the process of downloading already
+                    if (this.dtsVersionHistory === undefined && !this.fetchingDts) { 
+                        var filename = this.host.getTempDir() + '/dts-versions.json';
+                        var indexUrl = 'https://typescript-dts-service.azurewebsites.net/api/index/';
+                        var fileWriteTime: number = null;
+                        if (this.host.fileExists(filename)) {
+                            if (this.host.getFileWriteTime) {
+                                // Use file timestamp to avoid re-downloading entire index our copy is up-to-date
+                                fileWriteTime = this.host.getFileWriteTime(filename);
+                                indexUrl = indexUrl + fileWriteTime;
+                            }
+
+                            // Read index from disk
+                            this.dtsVersionHistory = JSON.parse(this.host.readFile(filename, 'utf-8'));
+                            doUpToDateCheck();
+                        }
+
+                        // Fetch from web
+                        this.fetchingDts = true;
+
+                        this.host.https(indexUrl, (err, data) => {
+                            this.fetchingDts = false;
+                            if (err) {
+                                // Define this so we don't retry continuously
+                                this.dtsVersionHistory = [];
+                            } else {
+                                if (data && data != 'null') { // server returns null string if we already have the latest index
+                                    this.host.writeFile(filename, data);
+                                    this.dtsVersionHistory = JSON.parse(data);
+                                    doUpToDateCheck();
+                                }
+                            }                            
+                        });
+                    } else if (this.dtsVersionHistory) {
+                        doUpToDateCheck();
+                    }
+                }
+            }
+            catch (err) {
+                this.logError(err, "up-to-date check");
+            }
+        }
+        
         private errorCheck(file: string, project: Project) {
             this.syntacticCheck(file, project);
             this.semanticCheck(file, project);
+            this.upToDateCheck(file, project);
         }
         
         private reloadProjects() {
@@ -275,6 +515,7 @@ namespace ts.server {
                         this.syntacticCheck(checkSpec.fileName, checkSpec.project);
                         this.immediateId = setImmediate(() => {
                             this.semanticCheck(checkSpec.fileName, checkSpec.project);
+                            this.upToDateCheck(checkSpec.fileName, checkSpec.project);
                             this.immediateId = undefined;
                             if (checkList.length > index) {
                                 this.errorTimer = setTimeout(checkOne, followMs);
@@ -622,6 +863,9 @@ namespace ts.server {
                                 NewLineCharacter: "\n",
                                 ConvertTabsToSpaces: formatOptions.ConvertTabsToSpaces,
                                 IndentStyle: ts.IndentStyle.Smart,
+                                SendMetrics: formatOptions.SendMetrics,
+                                TelemetryUserID: formatOptions.TelemetryUserID,
+                                CheckForDtsUpdates: formatOptions.CheckForDtsUpdates
                             };
                             var preferredIndent = compilerService.languageService.getIndentationAtPosition(file, position, editorOptions);
                             var hasIndent = 0;
@@ -716,14 +960,14 @@ namespace ts.server {
             if (!project) {
                 throw Errors.NoProject;
             }
-            
+
             var compilerService = project.compilerService;
             var position = compilerService.host.lineOffsetToPosition(file, line, offset);
             var helpItems = compilerService.languageService.getSignatureHelpItems(file, position);
             if (!helpItems) {
                 return undefined;
             }
-            
+
             var span = helpItems.applicableSpan;
             var result: protocol.SignatureHelpItems = {
                 items: helpItems.items,
@@ -735,10 +979,10 @@ namespace ts.server {
                 argumentIndex: helpItems.argumentIndex,
                 argumentCount: helpItems.argumentCount,
             }
-            
+
             return result;
         }
-                
+
         private getDiagnostics(delay: number, fileNames: string[]) {
             var checkList = fileNames.reduce((accum: PendingErrorCheck[], fileName: string) => {
                 fileName = ts.normalizePath(fileName);
@@ -750,7 +994,7 @@ namespace ts.server {
             }, []);
 
             if (checkList.length > 0) {
-                this.updateErrorCheck(checkList, this.changeSeq,(n) => n === this.changeSeq, delay)
+                this.updateErrorCheck(checkList, this.changeSeq, (n) => n == this.changeSeq, delay)
             }
         }
 
@@ -874,20 +1118,20 @@ namespace ts.server {
 
         private getBraceMatching(line: number, offset: number, fileName: string): protocol.TextSpan[] {
             var file = ts.normalizePath(fileName);
-            
+
             var project = this.projectService.getProjectForFile(file);
             if (!project) {
                 throw Errors.NoProject;
             }
-            
+
             var compilerService = project.compilerService;
             var position = compilerService.host.lineOffsetToPosition(file, line, offset);
-            
+
             var spans = compilerService.languageService.getBraceMatchingAtPosition(file, position);
             if (!spans) {
                 return undefined;
             }
-            
+
             return spans.map(span => ({
                 start: compilerService.host.positionToLineOffset(file, span.start),
                 end: compilerService.host.positionToLineOffset(file, span.start + span.length)
@@ -1079,17 +1323,18 @@ namespace ts.server {
         public onMessage(message: string) {
             if (this.logger.isVerbose()) {
                 this.logger.info("request: " + message);
-                var start = this.hrtime();                
             }
             try {
+                var start = this.hrtime();                
                 var request = <protocol.Request>JSON.parse(message);
+                Metrics.countEvent(request.command, this.projectService, this.host);
                 var {response, responseRequired} = this.executeCommand(request);
 
                 if (this.logger.isVerbose()) {
                     var elapsed = this.hrtime(start);
                     var seconds = elapsed[0]
                     var nanoseconds = elapsed[1];
-                    var elapsedMs = ((1e9 * seconds) + nanoseconds)/1000000.0;
+                    var elapsedMs = ((1e9 * seconds) + nanoseconds) / 1000000.0;
                     var leader = "Elapsed time (in milliseconds)";
                     if (!responseRequired) {
                         leader = "Async elapsed time (in milliseconds)";
@@ -1112,3 +1357,4 @@ namespace ts.server {
         }
     }
 }
+
